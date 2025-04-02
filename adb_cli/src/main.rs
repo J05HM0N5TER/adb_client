@@ -10,6 +10,7 @@ mod utils;
 use adb_client::{
     ADBDeviceExt, ADBServer, ADBServerDevice, ADBTcpDevice, ADBUSBDevice, MDNSDiscoveryService,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use adb_termios::ADBTermios;
 use anyhow::Result;
 use clap::Parser;
@@ -104,7 +105,7 @@ fn main() -> Result<()> {
 
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
-                    device.shell(std::io::stdin(), std::io::stdout())?;
+                    device.shell(&mut std::io::stdin(), Box::new(std::io::stdout()))?;
                 }
             } else {
                 let commands: Vec<&str> = commands.iter().map(|v| v.as_str()).collect();
