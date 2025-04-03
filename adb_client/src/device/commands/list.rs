@@ -53,8 +53,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let mut list_items = Vec::new();
 
         let transport = self.get_transport_mut();
-        let mut response = transport.read_message()?;
-        let mut payload = response.payload();
+        let mut payload = transport.read_message()?.into_payload();
         let mut current_index = 0;
         loop {
             // Get the next response if we ran out of payload. The payload always ends directly after a file name
@@ -62,8 +61,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 let message =
                     ADBTransportMessage::new(MessageCommand::Okay, local_id, remote_id, &[]);
                 transport.write_message(message)?;
-                response = transport.read_message()?;
-                payload = response.payload();
+                payload = transport.read_message()?.into_payload();
                 current_index = 0;
             }
             // Loop though the response for all the entries
@@ -95,6 +93,18 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                     let time = LittleEndian::read_u32(&mod_time);
                     let name_len = LittleEndian::read_u32(&name_len);
                     // Read the file name, since it requires the length from the name_len
+                    if (current_index + name_len as usize) > payload.len() {
+                        println!(
+                            "current_index: {}, name_len: {}, successfully read files: {} rest of output: {:?}",
+                            current_index,
+                            name_len,
+                            list_items.len(),
+                            payload[current_index..payload.len()].to_vec()
+                        );
+                        return Err(RustADBError::UnknownResponseType(
+                            "name length is larger than payload".to_string(),
+                        ));
+                    }
                     let name_buf =
                         payload[current_index..current_index + name_len as usize].to_vec();
                     current_index += name_len as usize;
