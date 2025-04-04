@@ -20,11 +20,59 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         output
     }
 
+    /// Request amount of bytes from transport, potentially across payloads
+    ///
+    /// This automatically request a new payload by sending back "Okay" and waiting for the next payload
+    /// It reads the request bytes across the existing payload, and if there is not enough bytes left,
+    /// reads the rest from the next payload
+    ///
+    ///   Current index                  
+    /// ┼───────────────┼   Requested    
+    ///                 ┌─────────────┐  
+    /// ┌───────────────┼───────┐     │  
+    /// └───────────────────────┘        
+    ///     Current             └─────┘  
+    ///     payload          Wanted in   
+    ///                      Next payload
+    fn read_bytes_from_transport(
+        requested_bytes: &usize,
+        current_index: &mut usize,
+        transport: &mut T,
+        payload: &mut Vec<u8>,
+        local_id: &u32,
+        remote_id: &u32,
+    ) -> Result<Vec<u8>> {
+        if *current_index + requested_bytes <= payload.len() {
+            // if there is enough bytes in this payload
+            // Copy from existing payload
+            let slice = &payload[*current_index..*current_index + requested_bytes];
+            *current_index += requested_bytes;
+            Ok(slice.to_vec())
+        } else {
+            // Read the rest of the existing payload, then continue with the next message
+            let mut slice = Vec::new();
+            let read_from_existing_payload = payload.len() - *current_index;
+            slice.extend_from_slice(
+                &payload[*current_index..*current_index + read_from_existing_payload],
+            );
+
+            // Request the next message
+            let send_message =
+                ADBTransportMessage::new(MessageCommand::Okay, *local_id, *remote_id, &[]);
+            transport.write_message(send_message)?;
+            // Read the new message
+            *payload = transport.read_message()?.into_payload();
+            let bytes_read_from_new_payload = requested_bytes - read_from_existing_payload;
+            slice.extend_from_slice(&payload[..bytes_read_from_new_payload]);
+            *current_index = bytes_read_from_new_payload;
+            Ok(slice)
+        }
+    }
+
     fn handle_list(&mut self, path: &str) -> Result<Vec<ADBListItem>> {
         // TODO: See if recursive is possible
         // TODO: use LIS2 to support files over 2.14 GB in size.
         // SEE: https://github.com/cstyan/adbDocumentation?tab=readme-ov-file#adb-list
-        // let mut len_buf = [0_u8; 4];
         let local_id = self.get_local_id()?;
         let remote_id = self.get_remote_id()?;
         {
@@ -56,58 +104,66 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let mut payload = transport.read_message()?.into_payload();
         let mut current_index = 0;
         loop {
-            // Get the next response if we ran out of payload. The payload always ends directly after a file name
-            if payload.len() == current_index {
-                let message =
-                    ADBTransportMessage::new(MessageCommand::Okay, local_id, remote_id, &[]);
-                transport.write_message(message)?;
-                payload = transport.read_message()?.into_payload();
-                current_index = 0;
-            }
             // Loop though the response for all the entries
             const STATUS_CODE_LENGTH_IN_BYTES: usize = 4;
-            match str::from_utf8(
-                &payload[current_index..current_index + STATUS_CODE_LENGTH_IN_BYTES],
-            )? {
+            let status_code = Self::read_bytes_from_transport(
+                &STATUS_CODE_LENGTH_IN_BYTES,
+                &mut current_index,
+                transport,
+                &mut payload,
+                &local_id,
+                &remote_id,
+            )?;
+            match str::from_utf8(&status_code)? {
                 "DENT" => {
-                    // Increase the current index after reading the command thing
-                    current_index += STATUS_CODE_LENGTH_IN_BYTES;
-
                     // Read the file mode, size, mod time and name length in one go, since all their sizes are predictable
                     const U32_SIZE_IN_BYTES: usize = 4;
-                    let file_mod =
-                        payload[current_index..current_index + U32_SIZE_IN_BYTES].to_vec();
-                    current_index += U32_SIZE_IN_BYTES;
-                    let file_size =
-                        payload[current_index..current_index + U32_SIZE_IN_BYTES].to_vec();
-                    current_index += U32_SIZE_IN_BYTES;
-                    let mod_time =
-                        payload[current_index..current_index + U32_SIZE_IN_BYTES].to_vec();
-                    current_index += U32_SIZE_IN_BYTES;
-                    let name_len =
-                        payload[current_index..current_index + U32_SIZE_IN_BYTES].to_vec();
-                    current_index += U32_SIZE_IN_BYTES;
+                    let mode = Self::read_bytes_from_transport(
+                        &U32_SIZE_IN_BYTES,
+                        &mut current_index,
+                        transport,
+                        &mut payload,
+                        &local_id,
+                        &remote_id,
+                    )?;
+                    let size = Self::read_bytes_from_transport(
+                        &U32_SIZE_IN_BYTES,
+                        &mut current_index,
+                        transport,
+                        &mut payload,
+                        &local_id,
+                        &remote_id,
+                    )?;
+                    let time = Self::read_bytes_from_transport(
+                        &U32_SIZE_IN_BYTES,
+                        &mut current_index,
+                        transport,
+                        &mut payload,
+                        &local_id,
+                        &remote_id,
+                    )?;
+                    let name_len = Self::read_bytes_from_transport(
+                        &U32_SIZE_IN_BYTES,
+                        &mut current_index,
+                        transport,
+                        &mut payload,
+                        &local_id,
+                        &remote_id,
+                    )?;
 
-                    let mode = LittleEndian::read_u32(&file_mod);
-                    let size = LittleEndian::read_u32(&file_size);
-                    let time = LittleEndian::read_u32(&mod_time);
-                    let name_len = LittleEndian::read_u32(&name_len);
+                    let mode = LittleEndian::read_u32(&mode);
+                    let size = LittleEndian::read_u32(&size);
+                    let time = LittleEndian::read_u32(&time);
+                    let name_len = LittleEndian::read_u32(&name_len) as usize;
                     // Read the file name, since it requires the length from the name_len
-                    if (current_index + name_len as usize) > payload.len() {
-                        println!(
-                            "current_index: {}, name_len: {}, successfully read files: {} rest of output: {:?}",
-                            current_index,
-                            name_len,
-                            list_items.len(),
-                            payload[current_index..payload.len()].to_vec()
-                        );
-                        return Err(RustADBError::UnknownResponseType(
-                            "name length is larger than payload".to_string(),
-                        ));
-                    }
-                    let name_buf =
-                        payload[current_index..current_index + name_len as usize].to_vec();
-                    current_index += name_len as usize;
+                    let name_buf = Self::read_bytes_from_transport(
+                        &name_len,
+                        &mut current_index,
+                        transport,
+                        &mut payload,
+                        &local_id,
+                        &remote_id,
+                    )?;
                     let name = String::from_utf8(name_buf)?;
 
                     // First 9 bits are the file permissions
