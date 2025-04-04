@@ -24,7 +24,6 @@ impl ADBServerDevice {
     }
 
     fn handle_list_command<S: AsRef<str>>(&mut self, path: S) -> Result<Vec<ADBListItem>> {
-        // TODO: See if recursive is possible
         // TODO: use LIS2 to support files over 2.14 GB in size.
         // SEE: https://github.com/cstyan/adbDocumentation?tab=readme-ov-file#adb-list
         let mut len_buf = [0_u8; 4];
@@ -48,41 +47,40 @@ impl ADBServerDevice {
                 .read_exact(&mut response)?;
             match str::from_utf8(response.as_ref())? {
                 "DENT" => {
-                    let mut file_mod = [0_u8; 4];
-                    let mut file_size = [0_u8; 4];
-                    let mut mod_time = [0_u8; 4];
+                    let mut mode = [0_u8; 4];
+                    let mut size = [0_u8; 4];
+                    let mut time = [0_u8; 4];
                     let mut name_len = [0_u8; 4];
 
                     let mut connection = self.transport.get_raw_connection()?;
-                    connection.read_exact(&mut file_mod)?;
-                    connection.read_exact(&mut file_size)?;
-                    connection.read_exact(&mut mod_time)?;
+                    connection.read_exact(&mut mode)?;
+                    connection.read_exact(&mut size)?;
+                    connection.read_exact(&mut time)?;
                     connection.read_exact(&mut name_len)?;
 
-                    let mode = LittleEndian::read_u32(&file_mod);
-                    let size = LittleEndian::read_u32(&file_size);
-                    let time = LittleEndian::read_u32(&mod_time);
+                    let mode = LittleEndian::read_u32(&mode);
+                    let size = LittleEndian::read_u32(&size);
+                    let time = LittleEndian::read_u32(&time);
                     let name_len = LittleEndian::read_u32(&name_len);
                     let mut name_buf = vec![0_u8; name_len as usize];
                     connection.read_exact(&mut name_buf)?;
                     let name = String::from_utf8(name_buf)?;
 
                     // First 9 bits are the file permissions
-                    let file_permissions = mode & 0b111111111;
+                    let permissions = mode & 0b111111111;
                     // Bits 14 to 16 are the file type
-                    let file_type = (mode >> 13) & 0b111;
-                    let item_type = match file_type {
+                    let item_type = match (mode >> 13) & 0b111 {
                         0b010 => ADBListItemType::Directory,
                         0b100 => ADBListItemType::File,
                         0b101 => ADBListItemType::Symlink,
-                        _ => return Err(RustADBError::UnknownFileMode(mode)),
+                        type_code => return Err(RustADBError::UnknownFileMode(type_code)),
                     };
                     let entry = ADBListItem {
                         item_type,
                         name,
                         time,
                         size,
-                        permissions: file_permissions,
+                        permissions,
                     };
                     list_items.push(entry);
                 }

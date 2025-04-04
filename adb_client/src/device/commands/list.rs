@@ -11,6 +11,7 @@ use std::str;
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// List the entries in the given directory on the device.
+    /// note: path uses internal file paths, so Documents is at /storage/emulated/0/Documents
     pub(crate) fn list(&mut self, path: &str) -> Result<Vec<ADBListItem>> {
         self.begin_synchronization()?;
 
@@ -51,9 +52,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         } else {
             // Read the rest of the existing payload, then continue with the next message
             let mut slice = Vec::new();
-            let read_from_existing_payload = payload.len() - *current_index;
+            let bytes_read_from_existing_payload = payload.len() - *current_index;
             slice.extend_from_slice(
-                &payload[*current_index..*current_index + read_from_existing_payload],
+                &payload[*current_index..*current_index + bytes_read_from_existing_payload],
             );
 
             // Request the next message
@@ -62,7 +63,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             transport.write_message(send_message)?;
             // Read the new message
             *payload = transport.read_message()?.into_payload();
-            let bytes_read_from_new_payload = requested_bytes - read_from_existing_payload;
+            let bytes_read_from_new_payload = requested_bytes - bytes_read_from_existing_payload;
             slice.extend_from_slice(&payload[..bytes_read_from_new_payload]);
             *current_index = bytes_read_from_new_payload;
             Ok(slice)
@@ -70,7 +71,6 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     }
 
     fn handle_list(&mut self, path: &str) -> Result<Vec<ADBListItem>> {
-        // TODO: See if recursive is possible
         // TODO: use LIS2 to support files over 2.14 GB in size.
         // SEE: https://github.com/cstyan/adbDocumentation?tab=readme-ov-file#adb-list
         let local_id = self.get_local_id()?;
@@ -87,7 +87,6 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             serialized_message.append(&mut len_buf);
             let mut path_bytes: Vec<u8> = Vec::from(path.as_bytes());
             serialized_message.append(&mut path_bytes);
-            drop(path_bytes);
 
             let message = ADBTransportMessage::new(
                 MessageCommand::Write,
@@ -118,38 +117,19 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 "DENT" => {
                     // Read the file mode, size, mod time and name length in one go, since all their sizes are predictable
                     const U32_SIZE_IN_BYTES: usize = 4;
-                    let mode = Self::read_bytes_from_transport(
-                        &U32_SIZE_IN_BYTES,
+                    const SIZE_OF_METADATA: usize = U32_SIZE_IN_BYTES * 4;
+                    let metadata = Self::read_bytes_from_transport(
+                        &SIZE_OF_METADATA,
                         &mut current_index,
                         transport,
                         &mut payload,
                         &local_id,
                         &remote_id,
                     )?;
-                    let size = Self::read_bytes_from_transport(
-                        &U32_SIZE_IN_BYTES,
-                        &mut current_index,
-                        transport,
-                        &mut payload,
-                        &local_id,
-                        &remote_id,
-                    )?;
-                    let time = Self::read_bytes_from_transport(
-                        &U32_SIZE_IN_BYTES,
-                        &mut current_index,
-                        transport,
-                        &mut payload,
-                        &local_id,
-                        &remote_id,
-                    )?;
-                    let name_len = Self::read_bytes_from_transport(
-                        &U32_SIZE_IN_BYTES,
-                        &mut current_index,
-                        transport,
-                        &mut payload,
-                        &local_id,
-                        &remote_id,
-                    )?;
+                    let mode = metadata[..U32_SIZE_IN_BYTES].to_vec();
+                    let size = metadata[U32_SIZE_IN_BYTES..2 * U32_SIZE_IN_BYTES].to_vec();
+                    let time = metadata[2 * U32_SIZE_IN_BYTES..3 * U32_SIZE_IN_BYTES].to_vec();
+                    let name_len = metadata[3 * U32_SIZE_IN_BYTES..4 * U32_SIZE_IN_BYTES].to_vec();
 
                     let mode = LittleEndian::read_u32(&mode);
                     let size = LittleEndian::read_u32(&size);
@@ -167,21 +147,20 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                     let name = String::from_utf8(name_buf)?;
 
                     // First 9 bits are the file permissions
-                    let file_permissions = mode & 0b111111111;
+                    let permissions = mode & 0b111111111;
                     // Bits 14 to 16 are the file type
-                    let file_type = (mode >> 13) & 0b111;
-                    let item_type = match file_type {
+                    let item_type = match (mode >> 13) & 0b111 {
                         0b010 => ADBListItemType::Directory,
                         0b100 => ADBListItemType::File,
                         0b101 => ADBListItemType::Symlink,
-                        _ => return Err(RustADBError::UnknownFileMode(mode)),
+                        type_code => return Err(RustADBError::UnknownFileMode(type_code)),
                     };
                     let entry = ADBListItem {
                         item_type,
                         name,
                         time,
                         size,
-                        permissions: file_permissions,
+                        permissions,
                     };
                     list_items.push(entry);
                 }
